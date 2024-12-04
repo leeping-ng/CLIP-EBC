@@ -7,6 +7,8 @@ from tqdm import tqdm
 import numpy as np
 from typing import Tuple, Union, Optional
 from warnings import warn
+from sklearn.model_selection import train_test_split
+import xml.etree.ElementTree as ET
 
 from datasets import standardize_dataset_name
 
@@ -34,15 +36,18 @@ def _calc_size(
     assert min_size <= max_size, f"min_size ({min_size}) must be less than or equal to max_size ({max_size})"
 
     aspect_ratios = (img_w / img_h, img_h / img_w)
-    if min_size / max_size <= min(aspect_ratios) <= max(aspect_ratios) <= max_size / min_size:  # possible to resize and preserve the aspect ratio
-        if min_size <= min(img_w, img_h) <= max(img_w, img_h) <= max_size:  # already within the range, no need to resize
+    # possible to resize and preserve the aspect ratio
+    if min_size / max_size <= min(aspect_ratios) <= max(aspect_ratios) <= max_size / min_size:
+        # already within the range, no need to resize
+        if min_size <= min(img_w, img_h) <= max(img_w, img_h) <= max_size:
             ratio = 1.
         elif min(img_w, img_h) < min_size:  # smaller than the minimum size, resize to the minimum size
             ratio = min_size / min(img_w, img_h)
         else:  # larger than the maximum size, resize to the maximum size
             ratio = max_size / max(img_w, img_h)
 
-        new_w, new_h = int(round(img_w * ratio / base) * base), int(round(img_h * ratio / base) * base)
+        new_w, new_h = int(round(img_w * ratio / base) *
+                           base), int(round(img_h * ratio / base) * base)
         new_w = max(min_size, min(max_size, new_w))
         new_h = max(min_size, min(max_size, new_h))
         return new_w, new_h
@@ -78,14 +83,16 @@ def _resize(image: np.ndarray, label: np.ndarray, min_size: int, max_size: int) 
         return image, label, False
     else:
         new_w, new_h = new_size
-        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC) if (new_w, new_h) != (image_w, image_h) else image
-        label = label * np.array([[new_w / image_w, new_h / image_h]]) if len(label) > 0 and (new_w, new_h) != (image_w, image_h) else label
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC) if (
+            new_w, new_h) != (image_w, image_h) else image
+        label = label * np.array([[new_w / image_w, new_h / image_h]]) if len(
+            label) > 0 and (new_w, new_h) != (image_w, image_h) else label
         return image, label, True
 
 
 def _preprocess(
-    dataset: str,
-    data_src_dir: str,
+    annotations_path: str,
+    data_images_dir: str,
     data_dst_dir: str,
     min_size: int,
     max_size: int,
@@ -124,21 +131,10 @@ def _preprocess(
     │   │   ├── 0002.npy
     │   │   ├── ...
     """
-    dataset = standardize_dataset_name(dataset)
-    assert os.path.isdir(data_src_dir), f"{data_src_dir} does not exist"
+
     os.makedirs(data_dst_dir, exist_ok=True)
-    print(f"Pre-processing {dataset} dataset...")
-    if dataset in ["sha", "shb"]:
-        _shanghaitech(data_src_dir, data_dst_dir, min_size, max_size, generate_npy)
-
-    elif dataset == "nwpu":
-        _nwpu(data_src_dir, data_dst_dir, min_size, max_size, generate_npy)
-
-    elif dataset == "qnrf":
-        _qnrf(data_src_dir, data_dst_dir, min_size, max_size, generate_npy)
-    
-    else:  # dataset == "jhu"
-        _jhu(data_src_dir, data_dst_dir, min_size, max_size, generate_npy)
+    _viso(annotations_path, data_images_dir,
+          data_dst_dir, min_size, max_size, generate_npy)
 
 
 def _resize_and_save(
@@ -185,46 +181,67 @@ def _resize_and_save(
         np.save(image_npy_dst_path, image_npy)
 
 
-def _shanghaitech(
-    data_src_dir: str,
+def parse_cvat_xml(file_path):
+    # Parse the XML file
+    tree = ET.parse(file_path)
+    root = tree.getroot()
+
+    # Initialize lists
+    image_list = []
+    label_list = []
+
+    # Iterate through each image in the XML
+    for image in root.findall('image'):
+        # Get the filename
+        filename = image.get('name')
+        image_list.append(filename)
+
+        # Collect points for this image
+        points_list = []
+        for point in image.findall('points'):
+            # Get the points attribute and convert to a tuple of floats
+            points = point.get('points')
+            if ";" in points:
+                continue
+            points_list.append(list(map(float, points.split(','))))
+
+        label_list.append(points_list)
+
+    return image_list, label_list
+
+
+def _viso(
+    cvat_annotations_path: str,
+    images_src_dir: str,
     data_dst_dir: str,
     min_size: int,
     max_size: int,
     generate_npy: bool = False
 ) -> None:
+
+    image_list, label_list = parse_cvat_xml(cvat_annotations_path)
+    image_list_train, image_list_val, label_list_train, label_list_val = train_test_split(
+        image_list, label_list, test_size=0.2, random_state=42)
+
     for split in ["train", "val"]:
-        generate_npy = generate_npy and split == "train"
-        print(f"Processing {split}...")
+        image_dst_dir = os.path.join(data_dst_dir, split, "images")
+        label_dst_dir = os.path.join(data_dst_dir, split, "labels")
+        os.makedirs(image_dst_dir, exist_ok=True)
+        os.makedirs(label_dst_dir, exist_ok=True)
+
         if split == "train":
-            image_src_dir = os.path.join(data_src_dir, "train_data", "images")
-            label_src_dir = os.path.join(data_src_dir, "train_data", "ground-truth")
-            image_src_paths = glob(os.path.join(image_src_dir, "*.jpg"))
-            label_src_paths = glob(os.path.join(label_src_dir, "*.mat"))
-            assert len(image_src_paths) == len(label_src_paths) in [300, 400], f"Expected 300 (part_A) or 400 (part_B) images and labels, got {len(image_src_paths)} images and {len(label_src_paths)} labels"
+            image_list_split, label_list_split = image_list_train, label_list_train
         else:
-            image_src_dir = os.path.join(data_src_dir, "test_data", "images")
-            label_src_dir = os.path.join(data_src_dir, "test_data", "ground-truth")
-            image_src_paths = glob(os.path.join(image_src_dir, "*.jpg"))
-            label_src_paths = glob(os.path.join(label_src_dir, "*.mat"))
-            assert len(image_src_paths) == len(label_src_paths) in [182, 316], f"Expected 182 (part_A) or 316 (part_B) images and labels, got {len(image_src_paths)} images and {len(label_src_paths)} labels"
+            image_list_split, label_list_split = image_list_val, label_list_val
 
-        sort_key = lambda x: int((os.path.basename(x).split(".")[0]).split("_")[-1])
-        image_src_paths.sort(key=sort_key)
-        label_src_paths.sort(key=sort_key)
+        for i in tqdm(range(len(image_list_split))):
+            image = cv2.imread(os.path.join(
+                images_src_dir, image_list_split[i]))
 
-        image_dst_dir = os.path.join(data_dst_dir, split, "images")
-        label_dst_dir = os.path.join(data_dst_dir, split, "labels")
-        os.makedirs(image_dst_dir, exist_ok=True)
-        os.makedirs(label_dst_dir, exist_ok=True)
+            label = label_list_split[i]
+            # name = os.path.splitext(image_list_split[i])[0]
+            name = f"{i+1:04}"
 
-        size = len(str(len(image_src_paths)))
-        for i, (image_src_path, label_src_path) in tqdm(enumerate(zip(image_src_paths, label_src_paths)), total=len(image_src_paths)):
-            image_id = int((os.path.basename(image_src_path).split(".")[0]).split("_")[-1])
-            label_id = int((os.path.basename(label_src_path).split(".")[0]).split("_")[-1])
-            assert image_id == label_id, f"Expected image id {image_id} to match label id {label_id}"
-            name = f"{(i + 1):0{size}d}"
-            image = cv2.imread(image_src_path)
-            label = loadmat(label_src_path)["image_info"][0][0][0][0][0]
             _resize_and_save(
                 image=image,
                 label=label,
@@ -236,211 +253,88 @@ def _shanghaitech(
                 max_size=max_size
             )
 
-        if split == "train":
-            _generate_random_indices(len(image_src_paths), os.path.join(data_dst_dir, split))
+    # for split in ["train", "val"]:
+    #     generate_npy = generate_npy and split == "train"
+    #     print(f"Processing {split}...")
+    #     if split == "train":
+    #         image_src_dir = os.path.join(data_src_dir, "train_data", "images")
+    #         label_src_dir = os.path.join(
+    #             data_src_dir, "train_data", "ground-truth")
+    #         image_src_paths = glob(os.path.join(image_src_dir, "*.jpg"))
+    #         label_src_paths = glob(os.path.join(label_src_dir, "*.mat"))
+    #         assert len(image_src_paths) == len(label_src_paths) in [
+    #             300, 400], f"Expected 300 (part_A) or 400 (part_B) images and labels, got {len(image_src_paths)} images and {len(label_src_paths)} labels"
+    #     else:
+    #         image_src_dir = os.path.join(data_src_dir, "test_data", "images")
+    #         label_src_dir = os.path.join(
+    #             data_src_dir, "test_data", "ground-truth")
+    #         image_src_paths = glob(os.path.join(image_src_dir, "*.jpg"))
+    #         label_src_paths = glob(os.path.join(label_src_dir, "*.mat"))
+    #         assert len(image_src_paths) == len(label_src_paths) in [
+    #             182, 316], f"Expected 182 (part_A) or 316 (part_B) images and labels, got {len(image_src_paths)} images and {len(label_src_paths)} labels"
 
-def _nwpu(
-    data_src_dir: str,
-    data_dst_dir: str,
-    min_size: int,
-    max_size: int,
-    generate_npy: bool = False
-) -> None:
-    for split in ["train", "val"]:
-        generate_npy = generate_npy and split == "train"
-        print(f"Processing {split}...")
-        with open(os.path.join(data_src_dir, f"{split}.txt"), "r") as f:
-            indices = f.read().splitlines()
-        indices = [idx.split(" ")[0] for idx in indices]
-        image_src_paths = [os.path.join(data_src_dir, f"images_part{min(5, (int(idx) - 1) // 1000 + 1)}", f"{idx}.jpg") for idx in indices]
-        label_src_paths = [os.path.join(data_src_dir, "mats", f"{idx}.mat") for idx in indices]
+    #     def sort_key(x): return int(
+    #         (os.path.basename(x).split(".")[0]).split("_")[-1])
+    #     image_src_paths.sort(key=sort_key)
+    #     label_src_paths.sort(key=sort_key)
 
-        image_dst_dir = os.path.join(data_dst_dir, split, "images")
-        label_dst_dir = os.path.join(data_dst_dir, split, "labels")
-        os.makedirs(image_dst_dir, exist_ok=True)
-        os.makedirs(label_dst_dir, exist_ok=True)
+    #     image_dst_dir = os.path.join(data_dst_dir, split, "images")
+    #     label_dst_dir = os.path.join(data_dst_dir, split, "labels")
+    #     os.makedirs(image_dst_dir, exist_ok=True)
+    #     os.makedirs(label_dst_dir, exist_ok=True)
 
-        size = len(str(len(image_src_paths)))
-        for i, (image_src_path, label_src_path) in tqdm(enumerate(zip(image_src_paths, label_src_paths)), total=len(image_src_paths)):
-            image_id = os.path.basename(image_src_path).split(".")[0]
-            label_id = os.path.basename(label_src_path).split(".")[0]
-            assert image_id == label_id, f"Expected image id {image_id} to match label id {label_id}"
-            name = f"{(i + 1):0{size}d}"
-            image = cv2.imread(image_src_path)
-            label = loadmat(label_src_path)["annPoints"]
-            _resize_and_save(
-                image=image,
-                label=label,
-                name=name,
-                image_dst_dir=image_dst_dir,
-                label_dst_dir=label_dst_dir,
-                generate_npy=generate_npy,
-                min_size=min_size,
-                max_size=max_size
-            )
+    #     size = len(str(len(image_src_paths)))
+    #     for i, (image_src_path, label_src_path) in tqdm(enumerate(zip(image_src_paths, label_src_paths)), total=len(image_src_paths)):
+    #         image_id = int(
+    #             (os.path.basename(image_src_path).split(".")[0]).split("_")[-1])
+    #         label_id = int(
+    #             (os.path.basename(label_src_path).split(".")[0]).split("_")[-1])
+    #         assert image_id == label_id, f"Expected image id {image_id} to match label id {label_id}"
+    #         name = f"{(i + 1):0{size}d}"
+    #         image = cv2.imread(image_src_path)
+    #         label = loadmat(label_src_path)["image_info"][0][0][0][0][0]
+    #         # label = [[ 29.6225116  472.92022152]
+    #         #  [ 54.35533603 454.96602305]
+    #         #  [ 51.79045053 460.46220626]
+    #         #  ...
+    #         #  [597.89732076 688.27900015]
+    #         #  [965.77518336 638.44693908]
+    #         #  [166.9965574  628.1873971 ]]
+    #         _resize_and_save(
+    #             image=image,
+    #             label=label,
+    #             name=name,
+    #             image_dst_dir=image_dst_dir,
+    #             label_dst_dir=label_dst_dir,
+    #             generate_npy=generate_npy,
+    #             min_size=min_size,
+    #             max_size=max_size
+    #         )
 
-        if split == "train":
-            _generate_random_indices(len(image_src_paths), os.path.join(data_dst_dir, split))
-    
-    # preprocess the test set
-    split = "test"
-    print(f"Processing {split}...")
-    with open(os.path.join(data_src_dir, f"{split}.txt"), "r") as f:
-        indices = f.read().splitlines()
-    indices = [idx.split(" ")[0] for idx in indices]
-    image_src_paths = [os.path.join(data_src_dir, f"images_part{min(5, (int(idx) - 1) // 1000 + 1)}", f"{idx}.jpg") for idx in indices]
-
-    image_dst_dir = os.path.join(data_dst_dir, split, "images")
-    os.makedirs(image_dst_dir, exist_ok=True)
-
-    for image_src_path in tqdm(image_src_paths):
-        image_id = os.path.basename(image_src_path).split(".")[0]
-        image = cv2.imread(image_src_path)
-        _resize_and_save(
-            image=image,
-            label=None,
-            name=image_id,
-            image_dst_dir=image_dst_dir,
-            label_dst_dir=None,
-            generate_npy=generate_npy,
-            min_size=min_size,
-            max_size=max_size
-        )
-
-
-def _qnrf(
-    data_src_dir: str,
-    data_dst_dir: str,
-    min_size: int,
-    max_size: int,
-    generate_npy: bool = False
-) -> None:
-    for split in ["train", "val"]:
-        generate_npy = generate_npy and split == "train"
-        print(f"Processing {split}...")
-        if split == "train":
-            image_src_dir = os.path.join(data_src_dir, "Train")
-            label_src_dir = os.path.join(data_src_dir, "Train")
-            image_src_paths = glob(os.path.join(image_src_dir, "*.jpg"))
-            label_src_paths = glob(os.path.join(label_src_dir, "*.mat"))
-            assert len(image_src_paths) == len(label_src_paths) == 1201, f"Expected 1201 images and labels, got {len(image_src_paths)} images and {len(label_src_paths)} labels"
-        else:
-            image_src_dir = os.path.join(data_src_dir, "Test")
-            label_src_dir = os.path.join(data_src_dir, "Test")
-            image_src_paths = glob(os.path.join(image_src_dir, "*.jpg"))
-            label_src_paths = glob(os.path.join(label_src_dir, "*.mat"))
-            assert len(image_src_paths) == len(label_src_paths) == 334, f"Expected 334 images and labels, got {len(image_src_paths)} images and {len(label_src_paths)} labels"
-        
-        sort_key = lambda x: int((os.path.basename(x).split(".")[0]).split("_")[1])
-        image_src_paths.sort(key=sort_key)
-        label_src_paths.sort(key=sort_key)
-
-        image_dst_dir = os.path.join(data_dst_dir, split, "images")
-        label_dst_dir = os.path.join(data_dst_dir, split, "labels")
-        os.makedirs(image_dst_dir, exist_ok=True)
-        os.makedirs(label_dst_dir, exist_ok=True)
-    
-        size = len(str(len(image_src_paths)))
-        for i, (image_src_path, label_src_path) in tqdm(enumerate(zip(image_src_paths, label_src_paths)), total=len(image_src_paths)):
-            image_id = int((os.path.basename(image_src_path).split(".")[0]).split("_")[1])
-            label_id = int((os.path.basename(label_src_path).split(".")[0]).split("_")[1])
-            assert image_id == label_id, f"Expected image id {image_id} to match label id {label_id}"
-            name = f"{(i + 1):0{size}d}"
-            image = cv2.imread(image_src_path)
-            label = loadmat(label_src_path)["annPoints"]
-            _resize_and_save(
-                image=image,
-                label=label,
-                name=name,
-                image_dst_dir=image_dst_dir,
-                label_dst_dir=label_dst_dir,
-                generate_npy=generate_npy,
-                min_size=min_size,
-                max_size=max_size
-            )
-
-        if split == "train":
-            _generate_random_indices(len(image_src_paths), os.path.join(data_dst_dir, split))
-
-def _jhu(
-    data_src_dir: str,
-    data_dst_dir: str,
-    min_size: int,
-    max_size: int,
-    generate_npy: bool = False
-) -> None:
-    for split in ["train", "val"]:
-        generate_npy = generate_npy and split == "train"
-        if split == "train":
-            with open(os.path.join(data_src_dir, "train", "image_labels.txt"), "r") as f:
-                train_names = f.read().splitlines()
-            train_names = [name.split(",")[0] for name in train_names]
-            train_image_src_paths = [os.path.join(data_src_dir, "train", "images", f"{name}.jpg") for name in train_names]
-            train_label_src_paths = [os.path.join(data_src_dir, "train", "gt", f"{name}.txt") for name in train_names]
-
-            with open(os.path.join(data_src_dir, "val", "image_labels.txt"), "r") as f:
-                val_names = f.read().splitlines()
-            val_names = [name.split(",")[0] for name in val_names]
-            val_image_src_paths = [os.path.join(data_src_dir, "val", "images", f"{name}.jpg") for name in val_names]
-            val_label_src_paths = [os.path.join(data_src_dir, "val", "gt", f"{name}.txt") for name in val_names]
-
-            image_src_paths = train_image_src_paths + val_image_src_paths
-            label_src_paths = train_label_src_paths + val_label_src_paths
-
-        else:
-            with open(os.path.join(data_src_dir, "test", "image_labels.txt"), "r") as f:
-                test_names = f.read().splitlines()
-            test_names = [name.split(",")[0] for name in test_names]
-            image_src_paths = [os.path.join(data_src_dir, "test", "images", f"{name}.jpg") for name in test_names]
-            label_src_paths = [os.path.join(data_src_dir, "test", "gt", f"{name}.txt") for name in test_names]
-
-        image_dst_dir = os.path.join(data_dst_dir, split, "images")
-        label_dst_dir = os.path.join(data_dst_dir, split, "labels")
-        os.makedirs(image_dst_dir, exist_ok=True)
-        os.makedirs(label_dst_dir, exist_ok=True)
-
-        size = len(str(len(image_src_paths)))
-        for i, (image_src_path, label_src_path) in tqdm(enumerate(zip(image_src_paths, label_src_paths)), total=len(image_src_paths)):
-            image_id = int(os.path.basename(image_src_path).split(".")[0])
-            label_id = int(os.path.basename(label_src_path).split(".")[0])
-            assert image_id == label_id, f"Expected image id {image_id} to match label id {label_id}"
-            name = f"{(i + 1):0{size}d}"
-            image = cv2.imread(image_src_path)
-            with open(label_src_path, "r") as f:
-                label = f.read().splitlines()
-            label = np.array([list(map(float, line.split(" ")[0: 2])) for line in label])
-            _resize_and_save(
-                image=image,
-                label=label,
-                name=name,
-                image_dst_dir=image_dst_dir,
-                label_dst_dir=label_dst_dir,
-                generate_npy=generate_npy,
-                min_size=min_size,
-                max_size=max_size
-            )
-
-        if split == "train":
-            _generate_random_indices(len(image_src_paths), os.path.join(data_dst_dir, split))
+    #     if split == "train":
+    #         _generate_random_indices(
+    #             len(image_src_paths), os.path.join(data_dst_dir, split))
 
 
 def parse_args():
-    parser = ArgumentParser(description="Pre-process datasets to resize images and labeld into a given range.")
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        choices=["nwpu", "ucf_qnrf", "jhu", "shanghaitech_a", "shanghaitech_b"],
-        required=True,
-        help="The dataset to pre-process."
-    )
-    parser.add_argument("--src_dir", type=str, required=True, help="The root directory of the source dataset.")
-    parser.add_argument("--dst_dir", type=str, required=True, help="The root directory of the destination dataset.")
-    parser.add_argument("--min_size", type=int, default=256, help="The minimum size of the shorter side of the image.")
-    parser.add_argument("--max_size", type=int, default=None, help="The maximum size of the longer side of the image.")
-    parser.add_argument("--generate_npy", action="store_true", help="Generate .npy files for images.")
+    parser = ArgumentParser(
+        description="Pre-process datasets to resize images and labeld into a given range.")
+    parser.add_argument("--annotations_path", type=str, required=True,
+                        help="The path of the CVAT annotation file.")
+    parser.add_argument("--images_dir", type=str, required=True,
+                        help="The root directory of the source dataset.")
+    parser.add_argument("--dst_dir", type=str, required=True,
+                        help="The root directory of the destination dataset.")
+    parser.add_argument("--min_size", type=int, default=256,
+                        help="The minimum size of the shorter side of the image.")
+    parser.add_argument("--max_size", type=int, default=None,
+                        help="The maximum size of the longer side of the image.")
+    parser.add_argument("--generate_npy", action="store_true",
+                        help="Generate .npy files for images.")
 
     args = parser.parse_args()
-    args.src_dir = os.path.abspath(args.src_dir)
+    args.annotations_path = os.path.abspath(args.annotations_path)
+    args.images_dir = os.path.abspath(args.images_dir)
     args.dst_dir = os.path.abspath(args.dst_dir)
     args.max_size = float("inf") if args.max_size is None else args.max_size
     return args
@@ -449,8 +343,8 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     _preprocess(
-        dataset=args.dataset,
-        data_src_dir=args.src_dir,
+        annotations_path=args.annotations_path,
+        data_images_dir=args.images_dir,
         data_dst_dir=args.dst_dir,
         min_size=args.min_size,
         max_size=args.max_size,
